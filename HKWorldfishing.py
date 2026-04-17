@@ -17,9 +17,11 @@ from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QCheckBox, QTextEdit, QPushButton, QGroupBox, QComboBox,
-    QDoubleSpinBox, QSpinBox
+    QDoubleSpinBox, QSpinBox, QMessageBox
 )
 from PyQt5.QtGui import QPixmap, QImage, QIcon
+import requests
+import webbrowser
 
 
 # ------------------------------- 动态获取资源路径 -------------------------------
@@ -92,15 +94,36 @@ def get_window_list():
     return windows
 
 
+# ------------------------------- 更新检查线程 -------------------------------
+class UpdateChecker(QThread):
+    update_available = pyqtSignal(str, str)  # latest_version, release_url
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        try:
+            url = "https://api.github.com/repos/daoqi/-AI-AI-Auto-Fishing-for-Honor-of-Kings-World/releases/latest"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                latest_version = data.get("tag_name", "").lstrip("v")
+                release_url = data.get("html_url", "")
+                if latest_version and latest_version > self.current_version:
+                    self.update_available.emit(latest_version, release_url)
+        except Exception as e:
+            print(f"检查更新失败: {e}")
+
+
 # ------------------------------- 检测线程（带状态机）-------------------------
 class DetectionWorker(QThread):
     frame_ready = pyqtSignal(bytes, int, int)
     log_message = pyqtSignal(str)
     fish_count_updated = pyqtSignal(int)
-    # 新增信号：将底层操作转移到主线程
-    request_click_left = pyqtSignal(tuple)          # (x, y) 或 (None,None) 表示中心
-    request_press_key = pyqtSignal(str)             # 单个按键
-    request_press_key_multiple = pyqtSignal(str, int)  # 按键, 次数
+    request_click_left = pyqtSignal(tuple)
+    request_press_key = pyqtSignal(str)
+    request_press_key_multiple = pyqtSignal(str, int)
 
     def __init__(self):
         super().__init__()
@@ -115,13 +138,11 @@ class DetectionWorker(QThread):
         self.last_action = {}
         self.fish_count = 0
 
-        # 状态机标志
         self.is_fishing = False
         self.waiting_exp = False
         self.exp_counted = False
         self.last_pull_time = 0
 
-        # 可配置参数
         self.global_conf = 0.6
         self.timeout_reset = 45
 
@@ -168,7 +189,6 @@ class DetectionWorker(QThread):
         if not self.ai_enabled:
             return
 
-        # 超时处理
         if self.waiting_exp and (time.time() - self.last_pull_time) > self.timeout_reset:
             self.log_message.emit("超时未检测到经验，强制重置状态")
             self.waiting_exp = False
@@ -222,7 +242,7 @@ class DetectionWorker(QThread):
                     self.request_press_key_multiple.emit(key, times)
                     for k in ['w', 's', 'a']:
                         self.request_press_key.emit(k)
-                        time.sleep(0.1)   # 注意：这里 sleep 仍在子线程，但只是短暂延时，一般没问题；若担心可也改为信号+QTimer，但保持简单。
+                        time.sleep(0.1)
 
             # 5. press_f 处理
             if any(label == 'press_f' for label, _ in detections_with_conf):
@@ -351,7 +371,6 @@ class MainWindow(QMainWindow):
         self.worker.log_message.connect(self.append_log)
         self.worker.fish_count_updated.connect(self.update_fish_count)
 
-        # 连接操作信号到主线程槽函数
         self.worker.request_click_left.connect(self.do_click_left)
         self.worker.request_press_key.connect(self.do_press_key)
         self.worker.request_press_key_multiple.connect(self.do_press_key_multiple)
@@ -409,7 +428,6 @@ class MainWindow(QMainWindow):
         display_group.setLayout(display_layout)
         right_layout.addWidget(display_group)
 
-        # 窗口设置（游戏窗口置顶）
         top_group = QGroupBox("窗口设置")
         top_layout = QVBoxLayout()
         self.game_top_checkbox = QCheckBox("游戏窗口置顶")
@@ -419,7 +437,6 @@ class MainWindow(QMainWindow):
         top_group.setLayout(top_layout)
         right_layout.addWidget(top_group)
 
-        # AI参数设置
         settings_group = QGroupBox("AI 参数设置")
         settings_layout = QVBoxLayout()
 
@@ -481,7 +498,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.append_log(f"注册热键失败: {e}，请以管理员身份运行程序")
 
-        # 倒计时相关
         self.ai_enable_timer = None
         self.ai_countdown = 0
 
@@ -490,6 +506,11 @@ class MainWindow(QMainWindow):
         self.append_log("AI已启动，请选择游戏窗口，然后点击「启动检测」或按 F12。")
         self.append_log("获取最新AI版本加入QQ群1098948146")
         self.append_log("AI阈值不要超过0.9 AI重置不能低于45")
+
+        # 启动更新检查（非阻塞）
+        self.update_checker = UpdateChecker(__version__)
+        self.update_checker.update_available.connect(self.on_update_available)
+        self.update_checker.start()
 
     # 主线程执行的底层操作
     def do_click_left(self, pos):
@@ -505,7 +526,6 @@ class MainWindow(QMainWindow):
     def do_press_key_multiple(self, key, times):
         press_key_multiple(key, times)
 
-    # 其他原有方法保持不变（窗口置顶、倒计时等）
     def nativeEvent(self, eventType, message):
         try:
             msg = message
@@ -542,7 +562,6 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.window_combo.setEnabled(False)
         self.refresh_btn.setEnabled(False)
-        # 如果游戏窗口置顶已勾选，自动置顶
         if self.game_top_checkbox.isChecked():
             win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
                                   win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
@@ -622,6 +641,17 @@ class MainWindow(QMainWindow):
     def on_timeout_changed(self, value):
         self.worker.timeout_reset = value
         self.append_log(f"AI超时重置时间已更改为: {value} 秒")
+
+    def on_update_available(self, latest_version, release_url):
+        reply = QMessageBox.question(
+            self,
+            "发现新版本",
+            f"当前版本 v{__version__}\n最新版本 v{latest_version}\n\n是否前往下载更新？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply == QMessageBox.Yes:
+            webbrowser.open(release_url)
 
     def update_frame(self, img_bytes, w, h):
         qimg = QImage.fromData(img_bytes)
