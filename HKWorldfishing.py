@@ -1,5 +1,6 @@
 from version import __version__
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 import sys
 os.environ['ULTRALYTICS_NO_EXPLORER'] = '1'
 os.environ['ULTRALYTICS_WEIGHTS_ONLY'] = '0'
