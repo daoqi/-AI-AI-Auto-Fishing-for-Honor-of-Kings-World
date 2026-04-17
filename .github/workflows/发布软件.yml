@@ -1,0 +1,37 @@
+﻿name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # 当推送 v1.0.0, v1.0.1 等标签时触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install -r requirements.txt   # 如果你有 requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --icon=logo.ico --add-data "ai/best.pt;ai" --name "HKWorldfishing" HKWorldfishing.py
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/HKWorldfishing.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,9 +1,8 @@
+from version import __version__
 import os
 import sys
-
 os.environ['ULTRALYTICS_NO_EXPLORER'] = '1'
 os.environ['ULTRALYTICS_WEIGHTS_ONLY'] = '0'
-
 import time
 import random
 import win32gui
@@ -321,7 +320,7 @@ class DetectionWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("王者荣耀世界AI钓鱼")
+        self.setWindowTitle(f"王者荣耀世界AI钓鱼  v{__version__}")
         self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet("""
             QMainWindow { background-color: #0a0f1a; }
