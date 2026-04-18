@@ -26,12 +26,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          # 安装 ONNX Runtime 和必需库（不再需要 torch 和 ultralytics）
           pip install onnxruntime opencv-python pillow pywin32 PyQt5 requests
+          # 安装 VC++ 运行库（解决 onnxruntime DLL 依赖）
+          choco install vcredist-all -y
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --icon=logo.ico --add-data "ai/best.onnx;ai" --name "HKWorldfishing" HKWorldfishing.py
+          pyinstaller --onefile --windowed --icon=logo.ico --add-data "ai/best.onnx;ai" --hidden-import onnxruntime --name "HKWorldfishing" HKWorldfishing.py
 
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
