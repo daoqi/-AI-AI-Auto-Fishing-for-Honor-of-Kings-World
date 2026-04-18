@@ -27,17 +27,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install onnxruntime opencv-python pillow pywin32 PyQt5 requests
-          # 安装 VC++ 运行库（解决 onnxruntime DLL 依赖）
-          choco install vcredist-all -y
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (OneDir)
         run: |
-          pyinstaller --onefile --windowed --icon=logo.ico --add-data "ai/best.onnx;ai" --hidden-import onnxruntime --name "HKWorldfishing" HKWorldfishing.py
+          pyinstaller --onedir --windowed --icon=logo.ico --add-data "ai/best.onnx;ai" --name "HKWorldfishing" HKWorldfishing.py
 
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/HKWorldfishing.exe
+          files: dist/HKWorldfishing
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           draft: false
