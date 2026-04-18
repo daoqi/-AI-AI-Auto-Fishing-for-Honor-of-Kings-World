@@ -1,1 +1,1 @@
-ultralyticsopencv-pythonpillowpywin32PyQt5requests# torch  # 注释掉，因为上面已经单独安装了 CPU 版
+ultralyticsopencv-pythonpillowpywin32PyQt5requests

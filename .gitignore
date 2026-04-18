@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .idea/
 venv/
+dist/
+build/
+*.spec
