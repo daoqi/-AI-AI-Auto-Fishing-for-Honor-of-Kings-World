@@ -1,7 +1,9 @@
+.idea/
+.venv/
 __pycache__/
 *.pyc
-.idea/
-venv/
+*.pyo
+*.spec
 dist/
 build/
-*.spec
+*.cache

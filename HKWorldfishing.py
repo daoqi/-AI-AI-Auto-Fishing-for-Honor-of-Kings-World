@@ -1,9 +1,8 @@
-from version import __version__
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # 不再需要，但保留无害
+
+from version import __version__
 import sys
-os.environ['ULTRALYTICS_NO_EXPLORER'] = '1'
-os.environ['ULTRALYTICS_WEIGHTS_ONLY'] = '0'
 import time
 import random
 import win32gui
@@ -12,7 +11,7 @@ import win32api
 import numpy as np
 from PIL import ImageGrab
 import cv2
-from ultralytics import YOLO
+import onnxruntime as ort
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,7 +22,6 @@ from PyQt5.QtGui import QPixmap, QImage, QIcon
 import requests
 import webbrowser
 
-
 # ------------------------------- 动态获取资源路径 -------------------------------
 def get_resource_path(relative_path):
     if getattr(sys, 'frozen', False):
@@ -32,13 +30,11 @@ def get_resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-
 def get_model_path():
-    return get_resource_path(os.path.join('ai', 'best.pt'))
-
+    return get_resource_path(os.path.join('ai', 'best.onnx'))  # 改为 onnx 文件
 
 MODEL_PATH = get_model_path()
-CAST_ROD_CONF = 0.55  # cast_rod 单独置信度
+CAST_ROD_CONF = 0.55
 REFRESH_MS = 100
 KEY_PRESS_DURATION = 0.05
 CLICK_DURATION = 0.1
@@ -50,73 +46,131 @@ COOLDOWN = {
     "press_f": 0.5,
 }
 
+# ------------------------------- YOLO ONNX 推理类 -------------------------------
+class YOLO_ONNX:
+    def __init__(self, model_path, conf_thres=0.6, iou_thres=0.45):
+        self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        self.conf_thres = conf_thres
+        self.iou_thres = iou_thres
+        # 获取输入输出信息
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_shape = self.session.get_inputs()[0].shape  # [1,3,640,640]
+        self.img_size = self.input_shape[2]  # 640
 
-# ------------------------------- 辅助函数（使用整数虚拟键码）-------------------------
+    def letterbox(self, img, new_shape=(640, 640), color=(114,114,114), auto=False, stride=32):
+        # 保持宽高比缩放
+        shape = img.shape[:2]  # h,w
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw, dh = dw // 2, dh // 2
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = dh, dh
+        left, right = dw, dw
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, (dw, dh), r
+
+    def preprocess(self, img):
+        # img: BGR numpy array
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img, pad, scale = self.letterbox(img, (self.img_size, self.img_size))
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2,0,1))  # HWC to CHW
+        img = np.expand_dims(img, axis=0)
+        return img, pad, scale
+
+    def postprocess(self, outputs, pad, scale, img_shape):
+        predictions = np.transpose(outputs[0])  # (8400,84)
+        boxes = []
+        scores = []
+        class_ids = []
+        pad_x = pad[0].item() if hasattr(pad[0], 'item') else pad[0]
+        pad_y = pad[1].item() if hasattr(pad[1], 'item') else pad[1]
+        scale_val = scale.item() if hasattr(scale, 'item') else scale
+        for pred in predictions:
+            conf = np.max(pred[4:])
+            if conf < self.conf_thres:
+                continue
+            class_id = np.argmax(pred[4:])
+            x = pred[0].item()
+            y = pred[1].item()
+            w = pred[2].item()
+            h = pred[3].item()
+            # 将归一化的坐标转换为原始图片坐标
+            x_center = (x - pad_x) / scale_val
+            y_center = (y - pad_y) / scale_val
+            width = w / scale_val
+            height = h / scale_val
+            x1 = int(x_center - width/2)
+            y1 = int(y_center - height/2)
+            x2 = int(x_center + width/2)
+            y2 = int(y_center + height/2)
+            boxes.append([x1, y1, x2, y2])
+            scores.append(conf)
+            class_ids.append(class_id)
+        if not boxes:
+            return []
+        indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf_thres, self.iou_thres)
+        detections = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                detections.append({
+                    'bbox': boxes[i],
+                    'confidence': scores[i],
+                    'class_id': class_ids[i]
+                })
+        return detections
+        # NMS
+        indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf_thres, self.iou_thres)
+        detections = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                detections.append({
+                    'bbox': boxes[i],
+                    'confidence': scores[i],
+                    'class_id': class_ids[i]
+                })
+        return detections
+
+    def predict(self, img):
+        input_tensor, pad, scale = self.preprocess(img)
+        outputs = self.session.run(self.output_names, {self.input_name: input_tensor})
+        detections = self.postprocess(outputs, pad, scale, img.shape)
+        return detections
+
+# ------------------------------- 辅助函数（不变） -------------------------------
 def click_left(x=None, y=None):
     if x is None or y is None:
-        x, y = win32api.GetSystemMetrics(0) // 2, win32api.GetSystemMetrics(1) // 2
+        x, y = win32api.GetSystemMetrics(0)//2, win32api.GetSystemMetrics(1)//2
     win32api.SetCursorPos((x, y))
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(CLICK_DURATION)
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-
 def press_key(key):
-    vk_map = {
-        'w': 0x57,
-        's': 0x53,
-        'a': 0x41,
-        'd': 0x44,
-        'f': 0x46,
-    }
+    vk_map = {'w': 0x57,'s': 0x53,'a': 0x41,'d': 0x44,'f': 0x46}
     vk = vk_map.get(key.lower())
     if vk:
         win32api.keybd_event(vk, 0, 0, 0)
         time.sleep(KEY_PRESS_DURATION)
         win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
 
-
 def press_key_multiple(key, times):
     for _ in range(times):
         press_key(key)
         time.sleep(0.05)
 
-
-# ------------------------------- 获取窗口列表 -------------------------------
 def get_window_list():
     windows = []
-
     def enum_callback(hwnd, _):
         if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
             windows.append((win32gui.GetWindowText(hwnd), hwnd))
-
     win32gui.EnumWindows(enum_callback, None)
     return windows
 
-
-# ------------------------------- 更新检查线程 -------------------------------
-class UpdateChecker(QThread):
-    update_available = pyqtSignal(str, str)  # latest_version, release_url
-
-    def __init__(self, current_version):
-        super().__init__()
-        self.current_version = current_version
-
-    def run(self):
-        try:
-            url = "https://api.github.com/repos/daoqi/-AI-AI-Auto-Fishing-for-Honor-of-Kings-World/releases/latest"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                latest_version = data.get("tag_name", "").lstrip("v")
-                release_url = data.get("html_url", "")
-                if latest_version and latest_version > self.current_version:
-                    self.update_available.emit(latest_version, release_url)
-        except Exception as e:
-            print(f"检查更新失败: {e}")
-
-
-# ------------------------------- 检测线程（带状态机）-------------------------
+# ------------------------------- 检测线程（使用 ONNX 模型）-------------------------
 class DetectionWorker(QThread):
     frame_ready = pyqtSignal(bytes, int, int)
     log_message = pyqtSignal(str)
@@ -137,6 +191,9 @@ class DetectionWorker(QThread):
         self.win_w = self.win_h = 0
         self.last_action = {}
         self.fish_count = 0
+        self.struggling = False  # 是否正在挣扎
+        self.struggle_start_time = 0  # 挣扎开始时间
+        self._last_struggle_key = 0  # 上次挣扎按键时间
 
         self.is_fishing = False
         self.waiting_exp = False
@@ -163,8 +220,8 @@ class DetectionWorker(QThread):
 
     def init_model(self):
         try:
-            self.model = YOLO(MODEL_PATH)
-            self.log_message.emit("模型加载成功")
+            self.model = YOLO_ONNX(MODEL_PATH, conf_thres=self.global_conf, iou_thres=0.45)
+            self.log_message.emit("ONNX 模型加载成功")
             return True
         except Exception as e:
             self.log_message.emit(f"模型加载失败: {e}")
@@ -185,93 +242,132 @@ class DetectionWorker(QThread):
             return True
         return False
 
-    def process_detections(self, detections_with_conf):
+    def process_detections(self, detections):
         if not self.ai_enabled:
             return
-
         if self.waiting_exp and (time.time() - self.last_pull_time) > self.timeout_reset:
             self.log_message.emit("超时未检测到经验，强制重置状态")
             self.waiting_exp = False
             self.exp_counted = False
             self.is_fishing = False
-
         try:
-            # 调试：打印 cast_rod 置信度
-            for label, conf in detections_with_conf:
-                if label == 'cast_rod':
-                    self.log_message.emit(f"cast_rod conf: {conf:.3f} (阈值: {CAST_ROD_CONF})")
-
-            # 1. 抛竿
-            if not self.is_fishing and not self.waiting_exp:
-                has_fishing_stand = any(label == 'fishing_stand' for label, _ in detections_with_conf)
-                has_cast_rod_high = any(
-                    label == 'cast_rod' and conf >= CAST_ROD_CONF for label, conf in detections_with_conf)
+            # 获取检测结果中的标签和置信度
+            labels_confs = [(self.model.names[d['class_id']], d['confidence']) for d in detections]
+            if labels_confs and self.ai_enabled:
+                self.log_message.emit(f"检测: {set([l for l,_ in labels_confs])}")
+            # 1. 抛竿：检测到 fishing_stand 和 cast_rod 就抛竿（无条件）
+            if not self.struggling:
+                has_fishing_stand = any(l == 'fishing_stand' for l, _ in labels_confs)
+                has_cast_rod_high = any(l == 'cast_rod' and conf >= CAST_ROD_CONF for l, conf in labels_confs)
                 if has_fishing_stand and has_cast_rod_high:
                     if self.can_act("cast", COOLDOWN["cast"]):
                         self.log_message.emit("抛竿")
                         self.request_click_left.emit((None, None))
                         self.is_fishing = True
+                        self.waiting_exp = False
                         self.exp_counted = False
+                    else:
+                        self.log_message.emit("[DEBUG] 抛竿冷却中")
+                else:
+                    # 可选：打印未满足条件的原因
+                    if not has_fishing_stand:
+                        self.log_message.emit("[DEBUG] 未检测到 fishing_stand")
+                    elif not has_cast_rod_high:
+                        cast_rod_conf = next((conf for l, conf in labels_confs if l == 'cast_rod'), None)
+                        if cast_rod_conf is not None:
+                            self.log_message.emit(
+                                f"[DEBUG] cast_rod 置信度 {cast_rod_conf:.3f} 低于阈值 {CAST_ROD_CONF}")
+                        else:
+                            self.log_message.emit("[DEBUG] 未检测到 cast_rod")
 
             # 2. 拉杆
             if self.is_fishing:
-                if any(label == 'fish_on_hook' for label, _ in detections_with_conf):
+                if any(l == 'fish_on_hook' for l, _ in labels_confs):
                     if self.can_act("pull", COOLDOWN["pull"]):
                         self.log_message.emit("鱼上钩，拉杆")
                         self.request_click_left.emit((None, None))
                         self.is_fishing = False
                         self.waiting_exp = True
                         self.last_pull_time = time.time()
+                        self.struggling = False  # 拉杆成功，结束挣扎
 
             # 3. 经验结算
             if self.waiting_exp and not self.exp_counted:
-                if any(label == 'exp' for label, _ in detections_with_conf):
+                if any(l == 'exp' for l, _ in labels_confs):
                     if self.can_act("exp", 0.5):
                         self.fish_count += 1
                         self.fish_count_updated.emit(self.fish_count)
                         self.log_message.emit(f"钓鱼成功！总鱼获次数: {self.fish_count}")
                         self.exp_counted = True
                         self.waiting_exp = False
+                        self.struggling = False
 
-            # 4. 特殊按键序列 fish_bite
-            if any(label == 'fish_bite' for label, _ in detections_with_conf):
-                if self.can_act("fish_bite", COOLDOWN["fish_bite"]):
-                    self.log_message.emit("特殊按键序列")
-                    times = random.randint(5, 8)
+            # 4. fish_bite
+            if any(l == 'fish_bite' for l, _ in labels_confs):
+                if not self.struggling and self.can_act("fish_bite", COOLDOWN["fish_bite"]):
+                    self.log_message.emit("钓大鱼需要操作，开始挣扎处理")
+                    self.struggling = True
+                    self.struggle_start_time = time.time()
+                    # 立即执行一次初始按键
                     key = random.choice(['d', 'a'])
-                    self.request_press_key_multiple.emit(key, times)
-                    for k in ['w', 's', 'a']:
-                        self.request_press_key.emit(k)
-                        time.sleep(0.1)
+                    self.request_press_key_multiple.emit(key, random.randint(3, 5))
 
-            # 5. press_f 处理
-            if any(label == 'press_f' for label, _ in detections_with_conf):
+            # 5. press_f
+            if any(l == 'press_f' for l,_ in labels_confs):
                 if self.can_act("press_f", COOLDOWN["press_f"]):
                     try:
                         self.log_message.emit("按 F 键并点击中心")
                         self.request_press_key.emit('f')
-                        cx, cy = win32api.GetSystemMetrics(0) // 2, win32api.GetSystemMetrics(1) // 2
+                        cx, cy = win32api.GetSystemMetrics(0)//2, win32api.GetSystemMetrics(1)//2
                         offset_x, offset_y = random.randint(-50, 50), random.randint(-50, 50)
-                        self.request_click_left.emit((cx + offset_x, cy + offset_y))
+                        self.request_click_left.emit((cx+offset_x, cy+offset_y))
                     except Exception as e:
                         self.log_message.emit(f"press_f 执行出错: {e}")
 
-            # 6. 快速按键序列
             rapid_actions = {
-                'rapid_d': 'd',
-                'rapid_a': 'a',
-                'press_a': 'a',
-                'press_w': 'w',
-                'press_s': 's',
-                'press_d': 'd'
+                'rapid_d': 'd', 'rapid_a': 'a', 'press_a': 'a',
+                'press_w': 'w', 'press_s': 's', 'press_d': 'd'
             }
             for label, key in rapid_actions.items():
-                if any(l == label for l, _ in detections_with_conf):
+                if any(l == label for l, _ in labels_confs):
                     if self.can_act(f"rapid_{label}", 1.0):
                         times = random.randint(3, 5)
                         self.log_message.emit(f"快速按键 {key} {times} 次")
                         self.request_press_key_multiple.emit(key, times)
                         break
+
+            # ========= 挣扎状态持续处理 =========
+            if self.struggling:
+                elapsed = time.time() - self.struggle_start_time
+                fish_on_hook_exists = any(l == 'fish_on_hook' for l, _ in labels_confs)
+                exp_exists = any(l == 'exp' for l, _ in labels_confs)
+                stand_or_rod = any(l in ('fishing_stand', 'cast_rod') for l, _ in labels_confs)
+
+                # 结束挣扎的条件：成功经验、脱钩（出现钓鱼台或抛竿）、鱼上钩消失、或保底超时15秒
+                if exp_exists or stand_or_rod or not fish_on_hook_exists or elapsed > 15.0:
+                    if elapsed > 15.0:
+                        self.log_message.emit("挣扎保底超时（15秒），强制结束")
+                    else:
+                        self.log_message.emit("挣扎结束（成功或脱钩）")
+                    self.struggling = False
+                    if stand_or_rod or not fish_on_hook_exists:
+                        self.is_fishing = False
+                        self.waiting_exp = False
+                else:
+                    # 持续快速按键，每 0.08 秒执行一次
+                    if time.time() - self._last_struggle_key > 0.08:
+                        self._last_struggle_key = time.time()
+                        # 优先根据检测到的挣扎方向按键
+                        if any(l == 'rapid_d' for l, _ in labels_confs):
+                            key = 'd'
+                        elif any(l == 'rapid_a' for l, _ in labels_confs):
+                            key = 'a'
+                        else:
+                            key = random.choice(['d', 'a'])
+                        times = random.randint(5, 8)
+                        self.log_message.emit(f"挣扎中：快速按键 {key} {times} 次")
+                        self.request_press_key_multiple.emit(key, times)
+            # ================================================================
 
         except Exception as e:
             self.log_message.emit(f"处理检测结果异常: {e}")
@@ -280,32 +376,32 @@ class DetectionWorker(QThread):
         if not self.init_model():
             return
         self.log_message.emit("初始化完成，等待启动检测...")
+        # 加载类别名称（从 ONNX 模型元数据获取，若无则手动定义）
+        self.model.names = [
+            'fishing_stand', 'cast_rod', 'fish_bite', 'rapid_d', 'rapid_a',
+            'press_f', 'exp', 'fish_on_hook', 'pull_rod', 'press_w',
+            'press_s', 'press_a', 'press_d'
+        ]
         while self.running:
             if not self.detection_enabled or self.game_rect is None:
                 time.sleep(0.2)
                 continue
             try:
                 img = self.capture_window()
-                results = self.model(img, conf=self.global_conf, verbose=False)
-                detections_with_conf = []
-                if results[0].boxes:
-                    for box in results[0].boxes:
-                        cls = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        label = self.model.names[cls]
-                        detections_with_conf.append((label, conf))
-                if detections_with_conf and self.ai_enabled:
-                    self.log_message.emit(f"检测: {set([d[0] for d in detections_with_conf])}")
-                self.process_detections(detections_with_conf)
+                detections = self.model.predict(img)
+                # 可选：绘制检测框用于显示
                 if self.display_enabled:
-                    try:
-                        annotated = results[0].plot()
-                        if annotated is not None and annotated.size > 0:
-                            success, encoded = cv2.imencode('.jpg', annotated)
-                            if success:
-                                self.frame_ready.emit(encoded.tobytes(), annotated.shape[1], annotated.shape[0])
-                    except Exception as e:
-                        self.log_message.emit(f"图像处理失败: {e}")
+                    annotated = img.copy()
+                    for d in detections:
+                        x1,y1,x2,y2 = d['bbox']
+                        label = self.model.names[d['class_id']]
+                        conf = d['confidence']
+                        cv2.rectangle(annotated, (x1,y1), (x2,y2), (0,255,0), 2)
+                        cv2.putText(annotated, f"{label} {conf:.2f}", (x1,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                    success, encoded = cv2.imencode('.jpg', annotated)
+                    if success:
+                        self.frame_ready.emit(encoded.tobytes(), annotated.shape[1], annotated.shape[0])
+                self.process_detections(detections)
             except Exception as e:
                 self.log_message.emit(f"检测循环异常: {e}")
             time.sleep(REFRESH_MS / 1000.0)
@@ -336,6 +432,7 @@ class DetectionWorker(QThread):
         self.display_enabled = enabled
         self.log_message.emit(f"画面显示{'已开启' if enabled else '已关闭'}")
 
+# ------------------------------- 主UI（基本不变）-------------------------
 
 # ------------------------------- 主UI --------------------------
 class MainWindow(QMainWindow):
@@ -441,11 +538,11 @@ class MainWindow(QMainWindow):
         settings_layout = QVBoxLayout()
 
         conf_layout = QHBoxLayout()
-        conf_label = QLabel("AI识别阈值 (默认0.6):")
+        conf_label = QLabel("AI识别阈值 (默认0.5):")
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.0, 1.0)
         self.conf_spin.setSingleStep(0.05)
-        self.conf_spin.setValue(0.6)
+        self.conf_spin.setValue(0.5)
         self.conf_spin.valueChanged.connect(self.on_conf_changed)
         conf_layout.addWidget(conf_label)
         conf_layout.addWidget(self.conf_spin)
@@ -508,9 +605,9 @@ class MainWindow(QMainWindow):
         self.append_log("AI阈值不要超过0.9 AI重置不能低于45")
 
         # 启动更新检查（非阻塞）
-        self.update_checker = UpdateChecker(__version__)
-        self.update_checker.update_available.connect(self.on_update_available)
-        self.update_checker.start()
+        # self.update_checker = UpdateChecker(__version__)
+        # self.update_checker.update_available.connect(self.on_update_available)
+        # self.update_checker.start()
 
     # 主线程执行的底层操作
     def do_click_left(self, pos):
