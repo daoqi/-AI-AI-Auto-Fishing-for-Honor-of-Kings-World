@@ -28,14 +28,18 @@ jobs:
           pip install pyinstaller
           pip install onnxruntime opencv-python pillow pywin32 PyQt5 requests
 
-      - name: Build with PyInstaller (OneDir)
+      - name: Build with PyInstaller
         run: |
           pyinstaller --onedir --windowed --icon=logo.ico --add-data "ai/best.onnx;ai" --name "HKWorldfishing" HKWorldfishing.py
+
+      - name: Compress output folder
+        run: |
+          Compress-Archive -Path dist/HKWorldfishing -DestinationPath HKWorldfishing.zip
 
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/HKWorldfishing
+          files: HKWorldfishing.zip
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           draft: false
