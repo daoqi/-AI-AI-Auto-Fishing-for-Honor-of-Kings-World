@@ -17,9 +17,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure Git safe directory
-        run: git config --global --add safe.directory ${{ github.workspace }}
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -29,12 +26,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          if (Test-Path requirements.txt) {
-            pip install -r requirements.txt
-          } else {
-            pip install ultralytics opencv-python pillow pywin32 PyQt5 requests
-          }
+          # 关键：从 CPU 源安装 PyTorch（不包含 CUDA）
+          pip install torch --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-cache-dir
+          pip install ultralytics opencv-python pillow pywin32 PyQt5 requests
 
       - name: Build with PyInstaller
         run: |
