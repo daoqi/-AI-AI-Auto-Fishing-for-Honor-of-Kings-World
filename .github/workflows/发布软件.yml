@@ -28,9 +28,23 @@ jobs:
           pip install pyinstaller
           pip install onnxruntime opencv-python pillow pywin32 PyQt5 requests
 
+      - name: Copy VC++ runtime DLLs
+        run: |
+          # 复制必要的运行时 DLL 到当前目录
+          Copy-Item "C:\Windows\System32\vcruntime140.dll" -Destination .\
+          Copy-Item "C:\Windows\System32\vcruntime140_1.dll" -Destination .\
+          Copy-Item "C:\Windows\System32\msvcp140.dll" -Destination .\
+          Copy-Item "C:\Windows\System32\vcomp140.dll" -Destination .\
+
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onedir --windowed --icon=logo.ico --add-data "ai/best.onnx;ai" --name "HKWorldfishing" HKWorldfishing.py
+          pyinstaller --onedir --windowed --icon=logo.ico `
+            --add-data "ai/best.onnx;ai" `
+            --add-data "vcruntime140.dll;." `
+            --add-data "vcruntime140_1.dll;." `
+            --add-data "msvcp140.dll;." `
+            --add-data "vcomp140.dll;." `
+            --name "HKWorldfishing" HKWorldfishing.py
 
       - name: Compress output folder
         run: |
