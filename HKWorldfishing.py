@@ -31,7 +31,7 @@ def get_resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 def get_model_path():
-    return get_resource_path(os.path.join('ai', 'best.onnx'))  # 改为 onnx 文件
+    return get_resource_path(os.path.join('ai', 'best.pt'))  # 改为 onnx 文件
 
 MODEL_PATH = get_model_path()
 CAST_ROD_CONF = 0.55
